@@ -16,6 +16,7 @@ from typing import List, Optional
 
 import pandas as pd
 
+
 # ----------------------------
 # CONFIGURATION
 # ----------------------------
@@ -42,7 +43,7 @@ EMAIL = "matt.doyle@casinonovascotia.com"
 RED_FLAG_TOPICS = {
 }
 
-FILTER_DATE = "2025-12-30"  # ISO yyyy-mm-dd
+FILTER_DATE = "2025-12-29"  # ISO yyyy-mm-dd
 USE_OUTLOOK = False          # set True to draft/send via Outlook COM
 
 
@@ -51,14 +52,13 @@ USE_OUTLOOK = False          # set True to draft/send via Outlook COM
 # ----------------------------
 
 def load_logs(csv_path: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
+    
 
-    # Normalize 'Occurred' to date
-    df["OccurredDate"] = pd.to_datetime(
-        df["Occurred"].astype(str).str.split().str[0],
-        format="%m/%d/%Y",
-        errors="coerce",
-    )
+    df = pd.read_csv(csv_path)
+    
+    mylist = df['Details'].tolist()
+    print(mylist)
+
 
     # Normalize High Priority to boolean
     hp = df.get("High Priority")
@@ -70,16 +70,10 @@ def load_logs(csv_path: str) -> pd.DataFrame:
         df["HighPriorityBool"] = False  # if missing, treat as False
 
     # Ensure text columns are strings to avoid errors
-    for c in ["Topic", "Details", "Location", "Sublocation"]:
+    for c in ["Topic", "Details"]:
         if c in df.columns:
             df[c] = df[c].astype(str)
     return df
-
-
-def only_date(df: pd.DataFrame, iso_date: str) -> pd.DataFrame:
-    target = pd.to_datetime(iso_date).date()
-    return df[df["OccurredDate"].dt.date == target].copy()
-
 
 def only_high_priority(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["HighPriorityBool"]].copy()
@@ -90,17 +84,10 @@ def rows_by_topics(df: pd.DataFrame, topics: List[str]) -> pd.DataFrame:
 
 
 def html_list(items: List[str]) -> str:
-    return "<p>N/A</p>" if not items else "<ul>\n" + "\n".join(f"  <li>{x}</li>" for x in items) + "\n</ul>"
-
+    return "<p>N/A</p>" if not items else "<ul>" + "".join(f"{x}<br>" for x in items) + "\n</ul>"
 
 def format_details(row: pd.Series) -> str:
-    loc = (row.get("Location") or "").strip()
-    sub = (row.get("Sublocation") or "").strip()
-    det = (row.get("Details") or "").strip()
-    if loc and sub:
-        return f"<strong>{loc}, {sub}:</strong> {det}"
-    elif loc:
-        return f"<strong>{loc}:</strong> {det}"
+    det = (row.get("Details") or "")
     return det
 
 
@@ -133,38 +120,40 @@ def players_html_table(p: Optional[pd.DataFrame]) -> str:
     rows = "\n".join("<tr>" + "".join(f"<td>{val}</td>" for val in p.iloc[i]) + "</tr>" for i in range(len(p)))
     return f'<table border="1" cellspacing="0" cellpadding="6">\n{header}\n{rows}\n</table>'
 
+def get_only_details(row: pd.Series) -> str:
+    return (row.get("Details") or "").strip()
+
 
 def build_email_html(
     report_date: str,
     author_name: str,
     to_line: str,
     cc_line: str,
-    df_hp_day: pd.DataFrame,
+    df_hp: pd.DataFrame,
     players_df: Optional[pd.DataFrame],
 ) -> str:
     # RED FLAGS (from high priority rows only)
-    red_flags_df = rows_by_topics(df_hp_day, list(RED_FLAG_TOPICS))
+    red_flags_df = rows_by_topics(df_hp, list(RED_FLAG_TOPICS))
     red_flags_items = [format_details(r) for _, r in red_flags_df.iterrows()]
     red_flags_html = html_list(red_flags_items)
 
     # REVIEWS / ROBS
-    reviews_df = rows_by_topics(df_hp_day, ["Requested Review", "Requested Observation", "Surveillance Initiated Review"])
+    reviews_df = rows_by_topics(df_hp, ["Requested Review", "Requested Observation", "Surveillance Initiated Review"])
     reviews_items = [format_details(r) for _, r in reviews_df.iterrows()]
     reviews_html = html_list(reviews_items)
 
     # TABLES (Observations at table sublocations)
-    tables_df = rows_by_topics(df_hp_day, ["Observation"])
-    tables_df = tables_df[tables_df["Sublocation"].str.contains("|".join(["BJ", "RB", "RL", "UTH"]), na=False)]
-    tables_items = [format_details(r) for _, r in tables_df.iterrows()]
+    tables_df = rows_by_topics(df_hp, ["Observation"])
+    tables_items = [get_only_details(det) for _, det in tables_df.iterrows()]
     tables_html = html_list(tables_items)
 
     # Highlights (High Action / Straight Flush)
-    highlight_df = rows_by_topics(df_hp_day, ["High Action", "Straight Flush"])
+    highlight_df = rows_by_topics(df_hp, ["High Action", "Straight Flush"])
     highlight_items = [format_details(r) for _, r in highlight_df.iterrows()]
     highlight_html = html_list(highlight_items)
 
     # SLOTS (Jackpot + slot tech observations) – high priority only
-    slots_df = rows_by_topics(df_hp_day, ["Jackpot", "Observation"])
+    slots_df = rows_by_topics(df_hp, ["Jackpot", "Observation"])
     slots_df = slots_df[
         slots_df["Location"].str.contains("Slot", na=False) |
         slots_df["Details"].str.contains("Slot Technician", na=False)
@@ -173,31 +162,31 @@ def build_email_html(
     slots_html = html_list(slots_items)
 
     # CAGE / COUNT
-    cc_df = df_hp_day[
-        (df_hp_day["Location"].str.contains("Cage", na=False) |
-         df_hp_day["Location"].str.contains("Count Room", na=False))
+    cc_df = df_hp[
+        (df_hp["Location"].str.contains("Cage", na=False) |
+         df_hp["Location"].str.contains("Count Room", na=False))
     ]
     cc_items = [format_details(r) for _, r in cc_df.iterrows()]
     cc_html = html_list(cc_items)
 
     # REMOVALS / PPA / VSE
-    removals_df = rows_by_topics(df_hp_day, ["Removal", "Alcohol related removal"])
+    removals_df = rows_by_topics(df_hp, ["Removal", "Alcohol related removal"])
     removals_items = [format_details(r) for _, r in removals_df.iterrows()]
     removals_html = html_list(removals_items)
 
     # MISC (ID shots + Parkade scans + other high-priority)
-    id_shots_items = extract_id_shots(df_hp_day)
-    parkade_items = extract_parkade_scans(df_hp_day)
-    misc_df = rows_by_topics(df_hp_day, ["Emergency BV Drop", "Information", "Armored Escort", "Security Escort"])
+    id_shots_items = extract_id_shots(df_hp)
+    parkade_items = extract_parkade_scans(df_hp)
+    misc_df = rows_by_topics(df_hp, ["Emergency BV Drop", "Information", "Armored Escort", "Security Escort"])
     misc_items = [format_details(r) for _, r in misc_df.iterrows()]
     misc_html = (
-        "<h4>ID Shots</h4>" + html_list(id_shots_items) +
-        "<h4>Parkade Scans</h4>" + html_list(parkade_items) +
-        "<h4>Other</h4>" + html_list(misc_items)
+        html_list(parkade_items) +
+html_list(id_shots_items) +
+html_list(misc_items)
     )
 
     # VISITORS
-    visitors_df = rows_by_topics(df_hp_day, ["Surveillance Visitor Log"])
+    visitors_df = rows_by_topics(df_hp, ["Surveillance Visitor Log"])
     visitors_items = [format_details(r) for _, r in visitors_df.iterrows()]
     visitors_html = html_list(visitors_items)
 
@@ -213,56 +202,35 @@ def build_email_html(
   {to_line}<br>
   {cc_line}</p>
 
-  <h3>RED FLAGS (High Priority)</h3>
+  <h3>RED FLAGS</h3>
   {red_flags_html}
 
   <h3>PLAYERS</h3>
   {players_html}
 
-  <h3>REVIEWS/ROBS (High Priority)</h3>
+  <h3>REVIEWS/ROBS</h3>
   {reviews_html}
 
   <h3>TABLES (High Priority Observations)</h3>
   {tables_html}
-
-  <h3>Highlights (High Action / Straight Flush)</h3>
   {highlight_html}
 
-  <h3>SLOTS (High Priority)</h3>
+  <h3>SLOTS</h3>
   {slots_html}
 
-  <h3>CAGE/COUNT (High Priority)</h3>
+  <h3>CAGE/COUNTROOM</h3>
   {cc_html}
 
-  <h3>REMOVALS/PPA/VSE (High Priority)</h3>
+  <h3>REMOVALS/PPA/VSE</h3>
   {removals_html}
 
-  <h3>MISC (High Priority)</h3>
+  <h3>MISC</h3>
   {misc_html}
 
-  <h3>VISITORS (High Priority)</h3>
+  <h3>VISITORS</h3>
   {visitors_html}
 
   <p><strong>D:</strong> <!-- add initials here e.g., PD/EG/SK: RC/MD/PK --></p>
-
-  <br>
-  <p><strong>{author_name}</strong><br>
-  {AUTHOR_TITLE}</p>
-
-  <p><strong>{COMPANY}</strong><br>
-  {ADDRESS}<br>
-  Phone: {PHONE}<br>
-  Email: {EMAIL}</p>
-
-  <p><em>GO FOR GREAT™</em></p>
-
-  <hr>
-  <small>
-  This E-mail message (including attachments, if any) is intended for the use of the individual or entity to which it is addressed and may contain
-  information that is privileged, proprietary, confidential and exempt from disclosure. If you are not the intended recipient, you are notified that any
-  dissemination, distribution or copying of this communication is strictly prohibited. If you have received this communication in error, please notify the
-  sender and erase this E-mail message immediately.
-  </small>
 </div>
 """
     return html
@@ -296,8 +264,7 @@ def save_html(html_body: str, filename: str = "DailyReport_HP_2025-12-29.html"):
 
 def main():
     df = load_logs(LOG_CSV)
-    df_day = only_date(df, FILTER_DATE)
-    df_hp_day = only_high_priority(df_day)   # <<< key filter
+    df_hp = only_high_priority(df)   # <<< key filter
 
     players_df = optional_players_table(PLAYERS_CSV)
 
@@ -306,7 +273,7 @@ def main():
         author_name=AUTHOR_NAME,
         to_line=TO_LINE,
         cc_line=CC_LINE,
-        df_hp_day=df_hp_day,
+        df_hp=df_hp,
         players_df=players_df,
     )
 
