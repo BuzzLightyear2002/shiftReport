@@ -1,287 +1,375 @@
-
 #!/usr/bin/env python3
 """
-Daily Report Email Builder (High Priority Only)
-
-Reads SearchResults.csv of daily logs, filters to the chosen date AND
-High Priority = TRUE, builds an HTML email body aligned to the template,
-and can optionally send via Outlook (Windows + Outlook required).
-
-Author: Your team
+Daily Report Email Builder (High Priority Only) -- 'Printed' CSV format
+- Parses 'Daily Log Detailed List Report' CSV (label/value pairs per row)
+- Detects bare token 'High Priority' as HighPriorityBool=True
+- NO DATE FILTER: includes all entries that appear in the CSV
+- Outputs HTML with no bullets and without Location/Sublocation
+- Adds a 'Not Categorized' section for high-priority items not matching any bucket
 """
 
+import csv
 import os
-from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict
 
+from numpy import empty
 import pandas as pd
-
 
 # ----------------------------
 # CONFIGURATION
 # ----------------------------
 
-LOG_CSV = "SearchResults.csv"      # your attached CSV of daily logs
-PLAYERS_CSV = "players.csv"        # optional; if missing, PLAYERS -> N/A
+PRINTED_CSV = "searchResults.csv"   # <-- your file name here
+PLAYERS_CSV = "players.csv"         # optional players table
 
-# Header fields (edit to suit)
-REPORT_DATE = "Monday, December 29th, 2025"
-AUTHOR_NAME = "Matt Doyle"
-AUTHOR_TITLE = "Surveillance Operator"
+HIGH_PRIORITY_ONLY = True  # keep True per your requirement
 
-# Distribution
-TO_LINE = "NSHFX Surveillance Employees"
-CC_LINE = "Troy Syms; Stacey Sinclair; Jason MacNeil; Dan Wandless"
-
-# Signature
-COMPANY = "CASINO NOVA SCOTIA"
-ADDRESS = "1983 Upper Water Street, Halifax, NS B3J 3Y5"
-PHONE = "902-496-6649"
-EMAIL = "matt.doyle@casinonovascotia.com"
-
-# Red flag topics (you can modify)
+# Optional RED FLAG topics (still High Priority, but shown under a RED FLAGS heading)
 RED_FLAG_TOPICS = {
+    # e.g., "Straight Flush", "FINTRAC"
 }
 
-FILTER_DATE = "2025-12-29"  # ISO yyyy-mm-dd
-USE_OUTLOOK = False          # set True to draft/send via Outlook COM
-
-
 # ----------------------------
-# HELPERS
+# PARSER FOR PRINTED EXPORT
 # ----------------------------
 
-def load_logs(csv_path: str) -> pd.DataFrame:
-    
+LABEL_MAP = {
+    "Log #:": "LogNumber",
+    "Department:": "Department",
+    "Property:": "Property",
+    "Owner:": "Owner",
+    "Location:": "Location",
+    "Created By:": "Created By",
+    "Sublocation:": "Sublocation",
+    "Occurred:": "Occurred",
+    "End Time:": "End Time",
+    "Camera/Monitor:": "Camera/Monitor",
+    "Status:": "Status",
+    "Duration:": "Duration",
+    "Topic:": "Topic",
+    "Details:": "Details",
+}
 
-    df = pd.read_csv(csv_path)
-    
-    mylist = df['Details'].tolist()
-    print(mylist)
+IGNORE_TOKENS = {
+    "Daily Log Detailed List Report",
+    "Page 1 / 1",
+}
+
+HIGH_PRIORITY_TOKEN = "High Priority"
 
 
-    # Normalize High Priority to boolean
-    hp = df.get("High Priority")
-    if hp is not None:
-        df["HighPriorityBool"] = (
-            hp.astype(str).str.strip().str.upper().isin({"TRUE", "T", "YES", "Y", "1"})
-        )
-    else:
-        df["HighPriorityBool"] = False  # if missing, treat as False
+def parse_printed_csv(path: str) -> pd.DataFrame:
+    """
+    Convert the 'printed' CSV (label/value pairs on each row) into a tidy DataFrame.
+    This export presents 'High Priority' as a bare token in the same row; we flag it.
+    """
+    records: List[Dict[str, str]] = []
 
-    # Ensure text columns are strings to avoid errors
-    for c in ["Topic", "Details"]:
-        if c in df.columns:
-            df[c] = df[c].astype(str)
+    def flush_record(cur: Dict[str, str]):
+        if any(cur.get(k) for k in ["LogNumber", "Topic", "Details"]):
+            records.append(cur.copy())
+
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row:
+                continue
+
+            cur: Dict[str, str] = {k: "" for k in LABEL_MAP.values()}
+            cur["HighPriorityBool"] = False
+
+            i, n = 0, len(row)
+            while i < n:
+                token = (row[i] or "").strip()
+
+                if not token or token in IGNORE_TOKENS:
+                    i += 1
+                    continue
+
+                if token == HIGH_PRIORITY_TOKEN:
+                    cur["HighPriorityBool"] = True
+                    i += 1
+                    continue
+
+                if token in LABEL_MAP:
+                    key = LABEL_MAP[token]
+                    value = ""
+                    if i + 1 < n:
+                        nxt = (row[i + 1] or "").strip()
+                        if nxt not in LABEL_MAP and nxt != HIGH_PRIORITY_TOKEN and nxt not in IGNORE_TOKENS:
+                            value = nxt
+                            i += 1
+                    cur[key] = value
+
+                i += 1
+
+            flush_record(cur)
+
+    df = pd.DataFrame.from_records(records)
+
+    # Normalize text fields
+    for col in ["Topic", "Details", "Location", "Sublocation", "Status"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("").astype(str)
+
+    # Ensure flag column exists
+    if "HighPriorityBool" not in df.columns:
+        df["HighPriorityBool"] = False
+
+    # Keep only meaningful rows
+    if "Topic" in df.columns:
+        df = df[(df["Topic"].str.len() > 0) | (df["Details"].str.len() > 0) | (df["LogNumber"].str.len() > 0)]
+
     return df
 
-def only_high_priority(df: pd.DataFrame) -> pd.DataFrame:
-    return df[df["HighPriorityBool"]].copy()
 
+# ----------------------------
+# RENDER HELPERS
+# ----------------------------
 
 def rows_by_topics(df: pd.DataFrame, topics: List[str]) -> pd.DataFrame:
-    return df[df["Topic"].isin(topics)].copy()
+    return df[df["Topic"].isin(topics)].copy() if not df.empty else df
 
+def _join_compact(lines: list[str]) -> str:
+    """Compact list: single line break between items."""
+    return "N/A" if not lines else "<br>".join(lines)
 
-def html_list(items: List[str]) -> str:
-    return "<p>N/A</p>" if not items else "<ul>" + "".join(f"{x}<br>" for x in items) + "\n</ul>"
+def lines_join_section(lines: list[str], compact: bool) -> str:
+    """
+    If compact=True  -> single break between items (for Observations, Jackpots, Parkade Scan, ID Shots)
+    If compact=False -> add an empty line between items (double break)
+    """
+    if not lines:
+        return "N/A"
+    sep = "<br>" if compact else "<br><br>"
+    return sep.join(lines)
 
-def format_details(row: pd.Series) -> str:
-    det = (row.get("Details") or "")
-    return det
-
-
-def extract_id_shots(df: pd.DataFrame) -> List[str]:
-    id_rows = df[(df["Topic"].str.contains("Pit Scan", na=False)) | (df["Details"].str.contains("ID Shots", na=False))]
-    return [str(r.get("Details", "")).strip() for _, r in id_rows.iterrows()]
-
-
-def extract_parkade_scans(df: pd.DataFrame) -> List[str]:
-    pk_rows = df[df["Topic"].str.contains("Parkade Scan", na=False)]
-    return [str(r.get("Details", "")).strip() for _, r in pk_rows.iterrows()]
-
-
-def optional_players_table(csv_path: str) -> Optional[pd.DataFrame]:
-    if os.path.exists(csv_path):
-        p = pd.read_csv(csv_path)
-        return p
-    return None
-
-
-def players_html_table(p: Optional[pd.DataFrame]) -> str:
-    if p is None or p.empty:
-        return "<p>N/A</p>"
-    cols = ["First Name", "Last Name", "Buy-In", "CasinoWin"]
-    p = p[[c for c in cols if c in p.columns]].copy()
-    for c in ["Buy-In", "CasinoWin"]:
-        if c in p.columns:
-            p[c] = p[c].astype(str)
-    header = "<tr>" + "".join(f"<th>{c}</th>" for c in p.columns) + "</tr>"
-    rows = "\n".join("<tr>" + "".join(f"<td>{val}</td>" for val in p.iloc[i]) + "</tr>" for i in range(len(p)))
-    return f'<table border="1" cellspacing="0" cellpadding="6">\n{header}\n{rows}\n</table>'
-
-def get_only_details(row: pd.Series) -> str:
+def details_only(row: pd.Series) -> str:
+    """Return only the Details text (no Location/Sublocation)."""
     return (row.get("Details") or "").strip()
 
+def is_table_games_observation(row: pd.Series) -> bool:
+    """
+    True if Topic == 'Observation' AND it looks like a table-games table.
+    Uses Sublocation markers seen in the export (BJ, RB, RL, UTH, LIR, Poker).
+    We don't print location/sublocation, but we use them to route.
+    """
+    if str(row.get("Topic", "")) != "Observation":
+        return False
+    sub = (row.get("Location") or "").upper()
+    table_markers = ("Pit")
+    return any(m in sub for m in table_markers)
 
-def build_email_html(
-    report_date: str,
-    author_name: str,
-    to_line: str,
-    cc_line: str,
-    df_hp: pd.DataFrame,
-    players_df: Optional[pd.DataFrame],
-) -> str:
-    # RED FLAGS (from high priority rows only)
-    red_flags_df = rows_by_topics(df_hp, list(RED_FLAG_TOPICS))
-    red_flags_items = [format_details(r) for _, r in red_flags_df.iterrows()]
-    red_flags_html = html_list(red_flags_items)
 
-    # REVIEWS / ROBS
-    reviews_df = rows_by_topics(df_hp, ["Requested Review", "Requested Observation", "Surveillance Initiated Review"])
-    reviews_items = [format_details(r) for _, r in reviews_df.iterrows()]
-    reviews_html = html_list(reviews_items)
+# ----------------------------
+# EMAIL BODY BUILDER
+# ----------------------------
 
-    # TABLES (Observations at table sublocations)
-    tables_df = rows_by_topics(df_hp, ["Observation"])
-    tables_items = [get_only_details(det) for _, det in tables_df.iterrows()]
-    tables_html = html_list(tables_items)
+def build_email_html(df_src: pd.DataFrame, players_df: Optional[pd.DataFrame]) -> str:
+    # High Priority only
+    df = df_src.copy()
+    if HIGH_PRIORITY_ONLY and "HighPriorityBool" in df.columns:
+        df = df[df["HighPriorityBool"]]
 
-    # Highlights (High Action / Straight Flush)
-    highlight_df = rows_by_topics(df_hp, ["High Action", "Straight Flush"])
-    highlight_items = [format_details(r) for _, r in highlight_df.iterrows()]
-    highlight_html = html_list(highlight_items)
+    # Topic buckets
+    topics_reviews = {"Requested Review", "Requested Observation", "Surveillance Initiated Review", "Service Review"}
+    topics_tables  = {"Observation"}  # we'll route only *table-game* Observations here
+    topics_slots   = {"Jackpot"}
+    topics_removals = {
+        "Removal", "Alcohol related removal", "PPA Issued/Violation",
+        "Self-Exclusion Violation", "Self-Exclusion Application", "Behaviour Related Removal"
+    }
+    topics_misc = {
+        "FINTRAC", "Information", "Security Escort", "Other", "Access Control",
+        "Criminal Activity - Driving under the influence", "Criminal Activity - Theft"
+    }
+    topics_highlights = {"Straight Flush", "Kings Bounty", "Royal Flush", "Four of a Kind"}
+    topics_idshots = {"Pit Scan"}   # ID shots live here
+    topics_parkade = {"Parkade Scan"}
+    topics_visitors = {"Surveillance Visitor Log"}
 
-    # SLOTS (Jackpot + slot tech observations) – high priority only
-    slots_df = rows_by_topics(df_hp, ["Jackpot", "Observation"])
-    slots_df = slots_df[
-        slots_df["Location"].str.contains("Slot", na=False) |
-        slots_df["Details"].str.contains("Slot Technician", na=False)
-    ]
-    slots_items = [format_details(r) for _, r in slots_df.iterrows()]
-    slots_html = html_list(slots_items)
+    # -----------------------------
+    # Observation routing (3-way)
+    # -----------------------------
+    obs_df = rows_by_topics(df, ["Observation"])
 
-    # CAGE / COUNT
-    cc_df = df_hp[
-        (df_hp["Location"].str.contains("Cage", na=False) |
-         df_hp["Location"].str.contains("Count Room", na=False))
-    ]
-    cc_items = [format_details(r) for _, r in cc_df.iterrows()]
-    cc_html = html_list(cc_items)
-
-    # REMOVALS / PPA / VSE
-    removals_df = rows_by_topics(df_hp, ["Removal", "Alcohol related removal"])
-    removals_items = [format_details(r) for _, r in removals_df.iterrows()]
-    removals_html = html_list(removals_items)
-
-    # MISC (ID shots + Parkade scans + other high-priority)
-    id_shots_items = extract_id_shots(df_hp)
-    parkade_items = extract_parkade_scans(df_hp)
-    misc_df = rows_by_topics(df_hp, ["Emergency BV Drop", "Information", "Armored Escort", "Security Escort"])
-    misc_items = [format_details(r) for _, r in misc_df.iterrows()]
-    misc_html = (
-        html_list(parkade_items) +
-html_list(id_shots_items) +
-html_list(misc_items)
+    # (a) TABLES: table-games observations (compact)
+    tables_df = obs_df[obs_df.apply(is_table_games_observation, axis=1)]
+    tables = lines_join_section(
+        [details_only(r) for _, r in tables_df.iterrows()],
+        compact=True  # compact for Observations
     )
 
-    # VISITORS
-    visitors_df = rows_by_topics(df_hp, ["Surveillance Visitor Log"])
-    visitors_items = [format_details(r) for _, r in visitors_df.iterrows()]
-    visitors_html = html_list(visitors_items)
 
-    # PLAYERS
-    players_html = players_html_table(players_df)
+    # (b) CAGE/COUNT: observations at Cage or Count Room should appear under Cage/Count section
+    obs_cage_count_df = obs_df[
+        obs_df["Location"].str.contains("Cage|Count Room", case=False, na=False)
+    ]
 
+    # (c) NON-TABLE, NON-CAGE/COUNT observations -> go to MISC (Other)
+    obs_misc_df = obs_df[
+        ~obs_df.index.isin(tables_df.index) &
+        ~obs_df.index.isin(obs_cage_count_df.index)
+    ]
+
+    # RED FLAGS (spaced)
+    red_flags = lines_join_section(
+        [details_only(r) for _, r in rows_by_topics(df, list(RED_FLAG_TOPICS)).iterrows()]
+        if RED_FLAG_TOPICS else [],
+        compact=False
+    )
+
+    # REVIEWS/ROBS (spaced)
+    reviews =lines_join_section(
+        [details_only(r) for _, r in rows_by_topics(df, list(topics_reviews)).iterrows()], 
+        compact=False
+    )
+
+    # Highlights (spaced)
+    highlights = lines_join_section(
+        [details_only(r) for _, r in rows_by_topics(df, list(topics_highlights)).iterrows()],
+        compact=False
+    )
+
+    if highlights == "N/A":
+        highlights = ""
+
+    # SLOTS -> Jackpots (compact)
+    slots = lines_join_section(
+        [details_only(r) for _, r in rows_by_topics(df, list(topics_slots)).iterrows()],
+        compact=True
+    )
+
+    # REMOVALS/PPA/VSE (spaced)
+    removals = lines_join_section(
+        [details_only(r) for _, r in rows_by_topics(df, list(topics_removals)).iterrows()],
+        compact=False
+    )
+
+    # ID Shots (compact)
+    idshots = lines_join_section(
+        [details_only(r) for _, r in rows_by_topics(df, list(topics_idshots)).iterrows()],
+        compact=True
+    )
+
+    # Parkade Scans (compact)
+    parkade = lines_join_section(
+        [details_only(r) for _, r in rows_by_topics(df, list(topics_parkade)).iterrows()],
+        compact=True
+    )
+
+    # -----------------------------
+    # CAGE/COUNT section (spaced)
+    # -----------------------------
+    cc_topic_rows = df[
+        df["Location"].str.contains("Cage|Count Room|TITO Self Redemption|Main Bank", case=False, na=False)
+    ]
+    cc_combined_df = pd.concat([cc_topic_rows, obs_cage_count_df]).drop_duplicates(ignore_index=True)
+    cage_count_html = lines_join_section(
+        [details_only(r) for _, r in cc_combined_df.iterrows()],
+        compact=False
+    )
+
+    # -----------------------------
+    # MISC -> Other (spaced) + non-table, non-cage/count Observations
+    # -----------------------------
+    misc_df = rows_by_topics(df, list(topics_misc))
+    misc_combined_df = pd.concat([obs_misc_df, misc_df], ignore_index=True)
+    misc_other = lines_join_section(
+        [details_only(r) for _, r in misc_combined_df.iterrows()],
+        compact=False
+    )
+
+    if misc_other == "N/A":
+        misc_other = ""
+
+    # VISITORS (spaced)
+    visitors = lines_join_section(
+        [details_only(r) for _, r in rows_by_topics(df, list(topics_visitors)).iterrows()],
+        compact=True
+    )
+
+    # NOT CATEGORIZED (spaced) = any HP topics not in handled sets
+    handled_topics = (
+        topics_reviews | topics_tables | topics_slots | topics_removals |
+        topics_misc | topics_highlights | topics_idshots | topics_parkade |
+        topics_visitors | set(RED_FLAG_TOPICS)
+    )
+    not_cat_df = df[~df["Topic"].isin(handled_topics)]
+    not_categorized = lines_join_section(
+        [details_only(r) for _, r in not_cat_df.iterrows()],
+        compact=False
+    )
+
+    # PLAYERS (optional; unchanged behavior)
+    players_html = "<p>N/A</p>"
+    if players_df is not None and not players_df.empty:
+        cols = [c for c in ["First Name", "Last Name", "Buy-In", "CasinoWin"] if c in players_df.columns]
+        if cols:
+            p = players_df[cols].copy().astype(str)
+            players_html = "<br>".join(f"{p.iloc[i].to_dict()}" for i in range(len(p)))
+
+    # Final HTML
     html = f"""
-<div style="font-family: Segoe UI, Arial, sans-serif; line-height:1.45;">
-  <p><strong>{REPORT_DATE}</strong></p>
-
-  <p>📣<br>
-  <strong>{author_name}</strong><br>
-  {to_line}<br>
-  {cc_line}</p>
-
+<div style="font-family: Segoe UI, Arial, sans-serif; line-height:1.45; font-size:14px;">
   <h3>RED FLAGS</h3>
-  {red_flags_html}
+  {red_flags}
 
   <h3>PLAYERS</h3>
   {players_html}
 
   <h3>REVIEWS/ROBS</h3>
-  {reviews_html}
+  {reviews}
 
-  <h3>TABLES (High Priority Observations)</h3>
-  {tables_html}
-  {highlight_html}
+  <h3>TABLES</h3>
+  {tables}
+<br><br>
+  {highlights}
 
   <h3>SLOTS</h3>
-  {slots_html}
+  {slots}
 
-  <h3>CAGE/COUNTROOM</h3>
-  {cc_html}
-
-  <h3>REMOVALS/PPA/VSE</h3>
-  {removals_html}
+  <h3>CAGE/COUNT</h3>
+  {cage_count_html}
 
   <h3>MISC</h3>
-  {misc_html}
+  {parkade}<br>
+  <br>{idshots}<br>
+  <br>{misc_other}
+
+  <h3>REMOVALS/PPA/VSE</h3>
+  {removals}
 
   <h3>VISITORS</h3>
-  {visitors_html}
+  {visitors}
 
-  <p><strong>D:</strong> <!-- add initials here e.g., PD/EG/SK: RC/MD/PK --></p>
+  <h3>Not Categorized</h3>
+  {not_categorized}
 </div>
 """
     return html
 
 
-def try_send_outlook(subject: str, html_body: str, to_line: str, cc_line: str):
-    try:
-        import win32com.client as win32
-        outlook = win32.Dispatch("Outlook.Application")
-        mail = outlook.CreateItem(0)
-        mail.To = to_line
-        mail.CC = cc_line
-        mail.Subject = subject
-        mail.HTMLBody = html_body
-        mail.Display()  # or mail.Send()
-        print("Draft opened in Outlook.")
-    except Exception as e:
-        print("Outlook send failed (is Outlook available?).")
-        print(e)
+def optional_players_table(csv_path: str) -> Optional[pd.DataFrame]:
+    if os.path.exists(csv_path):
+        try:
+            return pd.read_csv(csv_path)
+        except Exception:
+            return None
+    return None
 
 
-def save_html(html_body: str, filename: str = "DailyReport_HP_2025-12-29.html"):
+def save_html(html_body: str, filename: str = "DailyReport_HP_AllFromFile.html"):
     with open(filename, "w", encoding="utf-8") as f:
         f.write(html_body)
     print(f"Saved HTML email body to {filename}")
 
 
-# ----------------------------
-# MAIN
-# ----------------------------
-
 def main():
-    df = load_logs(LOG_CSV)
-    df_hp = only_high_priority(df)   # <<< key filter
-
+    df = parse_printed_csv(PRINTED_CSV)  # parses the new report format (High Priority token per row)
     players_df = optional_players_table(PLAYERS_CSV)
-
-    html_body = build_email_html(
-        report_date=REPORT_DATE,
-        author_name=AUTHOR_NAME,
-        to_line=TO_LINE,
-        cc_line=CC_LINE,
-        df_hp=df_hp,
-        players_df=players_df,
-    )
-
+    html_body = build_email_html(df, players_df)
     save_html(html_body)
-
-    if USE_OUTLOOK:
-        subject = f"Surveillance Daily Report (High Priority) – {REPORT_DATE}"
-        try_send_outlook(subject, html_body, TO_LINE, CC_LINE)
 
 
 if __name__ == "__main__":
