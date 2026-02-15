@@ -1,0 +1,1 @@
+C:\Users\raj.chauhan\Downloads\shiftReport\.venv\Scripts\pyinstaller --onefile --noconsole app_desktop.py

@@ -9,7 +9,9 @@ Daily Report Email Builder (High Priority Only) -- 'Printed' CSV format
 """
 
 import csv
+from operator import contains
 import os
+from pickle import TRUE
 from typing import List, Optional, Dict
 
 from numpy import empty
@@ -156,8 +158,8 @@ def is_table_games_observation(row: pd.Series) -> bool:
     """
     if str(row.get("Topic", "")) != "Observation":
         return False
-    sub = (row.get("Location") or "").upper()
-    table_markers = ("Pit")
+    sub = (row.get("Location")).upper()
+    table_markers = {"PIT"}
     return any(m in sub for m in table_markers)
 
 
@@ -170,7 +172,6 @@ def build_email_html(df_src: pd.DataFrame, players_df: Optional[pd.DataFrame]) -
     df = df_src.copy()
     if HIGH_PRIORITY_ONLY and "HighPriorityBool" in df.columns:
         df = df[df["HighPriorityBool"]]
-
     # Topic buckets
     topics_reviews = {"Requested Review", "Requested Observation", "Surveillance Initiated Review", "Service Review"}
     topics_tables  = {"Observation"}  # we'll route only *table-game* Observations here
@@ -181,7 +182,7 @@ def build_email_html(df_src: pd.DataFrame, players_df: Optional[pd.DataFrame]) -
     }
     topics_misc = {
         "FINTRAC", "Information", "Security Escort", "Other", "Access Control",
-        "Criminal Activity - Driving under the influence", "Criminal Activity - Theft"
+        "Criminal Activity - Driving under the influence", "Criminal Activity - Theft", "Integrity - Unsecured Assets", "Integrity"
     }
     topics_highlights = {"Straight Flush", "Kings Bounty", "Royal Flush", "Four of a Kind"}
     topics_idshots = {"Pit Scan"}   # ID shots live here
@@ -211,6 +212,69 @@ def build_email_html(df_src: pd.DataFrame, players_df: Optional[pd.DataFrame]) -
         ~obs_df.index.isin(tables_df.index) &
         ~obs_df.index.isin(obs_cage_count_df.index)
     ]
+
+    pro_df = rows_by_topics(df, ["Procedural Error"])
+
+# -----------------------------
+    # Procedural Error routing (3-way)
+    # -----------------------------
+    pro_df = rows_by_topics(df, ["Procedural Error"])
+
+    def is_table_games_site(row: pd.Series) -> bool:
+        """
+        Classify a row as TABLES for Procedural Error if it's clearly table-games:
+        - Location mentions 'Pit' (e.g., 'Pit 1', 'Pit 3'), OR
+        - Sublocation carries common table codes (BJ, RB, RL, UTH, LIR, POKER).
+        """
+        loc = (row.get("Location") or "").upper()
+        sub = (row.get("Sublocation") or "").upper()
+        if "PIT" in loc:
+            return True
+        table_markers = ("BJ", "RB", "RL", "UTH", "LIR", "POKER")
+        return any(m in sub for m in table_markers)
+
+    # (a) Cage/Count (Cage, Count Room, Main Bank, TITO Self Redemption)
+    pro_cage_count_rows = pro_df[
+        pro_df["Location"].str.contains("Cage|Count Room|Main Bank|TITO Self Redemption",
+                                        case=False, na=False)
+    ]
+
+    # (b) Tables (table-games sites)
+    pro_tables_rows = pro_df[pro_df.apply(is_table_games_site, axis=1)]
+
+    # (c) Misc (the remainder)
+    pro_misc_rows = pro_df[
+        ~pro_df.index.isin(pro_cage_count_rows.index) &
+        ~pro_df.index.isin(pro_tables_rows.index)
+    ]
+
+    # Render (Procedural Error entries are spaced, not compact)
+    pro_cage_count_df = lines_join_section(
+        [details_only(r) for _, r in pro_cage_count_rows.iterrows()],
+        compact=False
+    )
+    pro_tables_df = lines_join_section(
+        [details_only(r) for _, r in pro_tables_rows.iterrows()],
+        compact=False
+    )
+    pro_misc_df = lines_join_section(
+        [details_only(r) for _, r in pro_misc_rows.iterrows()],
+        compact=False
+    )
+
+    # Normalize "N/A" -> empty string so it doesn't add noise in sections
+    if pro_cage_count_df == "N/A":
+        pro_cage_count_df = ""
+    if pro_tables_df == "N/A":
+        pro_tables_df = ""
+    if pro_misc_df == "N/A":
+        pro_misc_df = ""
+
+    print(pro_misc_df)
+    tables = lines_join_section(
+        [details_only(r) for _, r in tables_df.iterrows()],
+        compact=True  # compact for Observations
+    )
 
     # RED FLAGS (spaced)
     red_flags = lines_join_section(
@@ -266,8 +330,8 @@ def build_email_html(df_src: pd.DataFrame, players_df: Optional[pd.DataFrame]) -
     ]
     cc_combined_df = pd.concat([cc_topic_rows, obs_cage_count_df]).drop_duplicates(ignore_index=True)
     cage_count_html = lines_join_section(
-        [details_only(r) for _, r in cc_combined_df.iterrows()],
-        compact=False
+        [details_only(r) for _, r in obs_cage_count_df.iterrows()],
+        compact=True
     )
 
     # -----------------------------
@@ -293,7 +357,7 @@ def build_email_html(df_src: pd.DataFrame, players_df: Optional[pd.DataFrame]) -
     handled_topics = (
         topics_reviews | topics_tables | topics_slots | topics_removals |
         topics_misc | topics_highlights | topics_idshots | topics_parkade |
-        topics_visitors | set(RED_FLAG_TOPICS)
+        topics_visitors | {"Procedural Error"} | set(RED_FLAG_TOPICS)
     )
     not_cat_df = df[~df["Topic"].isin(handled_topics)]
     not_categorized = lines_join_section(
@@ -312,38 +376,63 @@ def build_email_html(df_src: pd.DataFrame, players_df: Optional[pd.DataFrame]) -
     # Final HTML
     html = f"""
 <div style="font-family: Segoe UI, Arial, sans-serif; line-height:1.45; font-size:14px;">
-  <h3>RED FLAGS</h3>
-  {red_flags}
+ <p style="font-size:inherit; font-weight:700; color:red; text-decoration:underline; margin:0;">RED FLAGS</p>
+   <br>
+{red_flags}
 
-  <h3>PLAYERS</h3>
+  <br> <br>
+ <p style="font-size:inherit; font-weight:700; text-decoration:underline; margin:0;">PLAYERS</p> <br>
+
   {players_html}
 
-  <h3>REVIEWS/ROBS</h3>
+   <br>
+<p style="font-size:inherit; font-weight:700; text-decoration:underline; margin:0;">REVIEWS/ROBS</p> <br>
+
   {reviews}
 
-  <h3>TABLES</h3>
-  {tables}
-<br><br>
-  {highlights}
+  <br> <br>
+ <p style="font-size:inherit; font-weight:700; text-decoration:underline; margin:0;">TABLES</p> <br>
 
-  <h3>SLOTS</h3>
+  {tables}
+
+
+<br><br>
+  {highlights}<br><br>
+
+    {pro_tables_df}
+
+   <br>
+<p style="font-size:inherit; font-weight:700; text-decoration:underline; margin:0;">SLOTS</p> <br>
+
   {slots}
 
-  <h3>CAGE/COUNT</h3>
-  {cage_count_html}
+  <br> <br>
+ <p style="font-size:inherit; font-weight:700; text-decoration:underline; margin:0;">CAGE/COUNT</p> <br>
 
-  <h3>MISC</h3>
+  {cage_count_html}<br><br>
+  {pro_cage_count_df}
+
+   <br>
+<p style="font-size:inherit; font-weight:700; text-decoration:underline; margin:0;">MISC</p> <br>
+
   {parkade}<br>
   <br>{idshots}<br>
   <br>{misc_other}
+  {pro_misc_df}
 
-  <h3>REMOVALS/PPA/VSE</h3>
+   <br> <br>
+<p style="font-size:inherit; font-weight:700; text-decoration:underline; margin:0;">REMOVALS/PPA/VSE</p> <br>
+
   {removals}
 
-  <h3>VISITORS</h3>
+   <br> <br>
+<p style="font-size:inherit; font-weight:700; text-decoration:underline; margin:0;">VISITORS</p> <br>
+
   {visitors}
 
-  <h3>Not Categorized</h3>
+  <br> <br>
+ <p style="font-size:inherit; font-weight:700; text-decoration:underline; margin:0;">Not Categorized</p> <br>
+
   {not_categorized}
 </div>
 """
